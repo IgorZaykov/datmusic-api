@@ -25,9 +25,10 @@ trait SearchesTrait
     /**
      * Searches audios from request query, with caching
      * @param Request $request
+     * @param $type string type of search
      * @return array
      */
-    public function search(Request $request)
+    public function search(Request $request, $type = '')
     {
         // get inputs
         $query = trim($request->get('q'));
@@ -37,7 +38,7 @@ trait SearchesTrait
 
         // return immediately if has in cache
         if ($this->hasRequestInCache($request)) {
-            logger()->searchCache($query, $offset);
+            logger()->searchCache($type . $query, $offset);
 
             return $this->ok(
                 $this->transformSearchResponse(
@@ -54,7 +55,7 @@ trait SearchesTrait
         }
 
         // send request
-        $response = $this->getSearchResults($query, $offset);
+        $response = $this->getSearchResults($query, $offset, $type);
 
         // check for security checks
         $this->authSecurityCheck($response);
@@ -77,7 +78,7 @@ trait SearchesTrait
             // increment offset
             $offset += 50;
             // get result and parse it
-            $resultData = $this->getAudioItems($this->getSearchResults($query, $offset));
+            $resultData = $this->getAudioItems($this->getSearchResults($query, $offset, $type));
 
             //  we can't request more pages if result is empty, break the loop
             if (empty($resultData)) {
@@ -90,7 +91,7 @@ trait SearchesTrait
         // store in cache
         Cache::put($cacheKey, $result, config('app.cache.duration'));
 
-        logger()->search($query, $offset);
+        logger()->search($type . $query, $offset);
 
         // parse data, save in cache, and response
         return $this->ok($this->transformSearchResponse(
@@ -100,12 +101,26 @@ trait SearchesTrait
     }
 
     /**
+     * Get audios of the user
+     * @param Request $request
+     * @param $id
+     * @return array
+     */
+    public function searchUser(Request $request, $id)
+    {
+        // replace query with id from path
+        $request->merge(["q" => $id]);
+        return $this->search($request, 'user');
+    }
+
+    /**
      * Request search page
      * @param $query
      * @param $offset
+     * @param $type string type of search
      * @return ResponseInterface
      */
-    private function getSearchResults($query, $offset)
+    private function getSearchResults($query, $offset, $type)
     {
         if (empty($query)) {
             if (config('app.popularSearchEnabled')) {
@@ -115,9 +130,15 @@ trait SearchesTrait
             }
         }
 
-        $query = urlencode($query);
+        if ($type == 'user') {
+            $path = "audio?id=$query&offset=$offset";
+        } else {
+            $query = urlencode($query);
+            $path = "audio?act=search&q=$query&offset=$offset";
+        }
+
         return httpClient()->get(
-            "audio?act=search&q=$query&offset=$offset",
+            $path,
             ['cookies' => $this->jar]
         );
     }
