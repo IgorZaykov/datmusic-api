@@ -25,7 +25,7 @@ trait CachesTrait
 
         $q = empty($q) ? md5('popular') : $q;
 
-        return hash(config('app.hash.cache'), ($q.$page));
+        return base64url_encode(json_encode(['q' => $q, 'p' => $page]));
     }
 
     /**
@@ -65,22 +65,15 @@ trait CachesTrait
 
         if (is_null($data)) {
             logger()->log('Cache.NoAudio', $key, $id);
-            if ($abort) {
-                abort(404);
-            }
 
-            return;
+            return null;
         }
 
         // search audio by audio id/hash
         $key = array_search($id, array_column($data, 'id'));
 
         if ($key === false) {
-            if ($abort) {
-                abort(404);
-            }
-
-            return;
+            return null;
         }
 
         $item = $data[$key];

@@ -76,3 +76,33 @@ function randomArtist()
 
     return $randomArray[$randomIndex];
 }
+
+/**
+ * base64url RFC4648 encoding.
+ *
+ * @param string $data
+ * @param string $pad
+ *
+ * @return mixed|string
+ */
+function base64url_encode($data, $pad = null)
+{
+    $data = str_replace(['+', '/'], ['-', '_'], base64_encode($data));
+    if (! $pad) {
+        $data = rtrim($data, '=');
+    }
+
+    return $data;
+}
+
+/**
+ * base64url RFC4648 decoding.
+ *
+ * @param string $data
+ *
+ * @return bool|string
+ */
+function base64url_decode($data)
+{
+    return base64_decode(str_replace(['-', '_'], ['+', '/'], $data));
+}

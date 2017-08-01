@@ -7,8 +7,8 @@
 namespace App\Datmusic;
 
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 use Psr\Http\Message\ResponseInterface;
+use Illuminate\Support\Facades\Request as R;
 
 trait SearchesTrait
 {
@@ -101,6 +101,24 @@ trait SearchesTrait
             $request,
             $result
         ));
+    }
+
+    /**
+     * Gets query and page from key and searches.
+     *
+     * @param $key
+     *
+     * @return array
+     */
+    public function searchFromKey($key)
+    {
+        $search = json_decode(base64url_decode($key));
+        R::replace([
+            'q'    => $search->q,
+            'page' => $search->p,
+        ]);
+
+        return $this->search(R::instance());
     }
 
     /**

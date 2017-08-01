@@ -56,6 +56,15 @@ trait DownloaderTrait
         return Cache::rememberForever($cacheKey, function () use ($key, $id) {
             $item = $this->getAudio($key, $id);
 
+            if ($item == null) {
+                $this->searchFromKey($key);
+                $item = $this->getAudio($key, $id);
+                // if it's still null, we are done.
+                if ($item == null) {
+                    abort(404);
+                }
+            }
+
             $response = httpClient()->head($item['mp3']);
 
             return $response->getHeader('Content-Length')[0];
@@ -127,7 +136,7 @@ trait DownloaderTrait
             $item = $this->getAudioCache($id);
             // try looking in search cache if not found
             if (is_null($item)) {
-                $item = $this->getAudio($key, $id, false);
+                $item = $this->getAudio($key, $id);
             }
             $name = ! is_null($item) ? $this->getFormattedName($item) : "$id.mp3";
 
@@ -137,6 +146,15 @@ trait DownloaderTrait
         }
 
         $item = $this->getAudio($key, $id);
+        if ($item == null) {
+            $this->searchFromKey($key);
+            $item = $this->getAudio($key, $id);
+            // if it's still null, we are done.
+            if ($item == null) {
+                abort(404);
+            }
+        }
+
         $name = $this->getFormattedName($item);
 
         if ($this->isS3) {
