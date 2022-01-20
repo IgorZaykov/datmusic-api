@@ -6,12 +6,14 @@
 
 namespace App\Http\Controllers;
 
-use App\Datmusic\SearchesTrait;
+use App\Datmusic\DeemixTrait;
 use App\Datmusic\DownloaderTrait;
+use App\Datmusic\SearchesTrait;
+use Illuminate\Http\JsonResponse;
 
 class ApiController extends Controller
 {
-    use SearchesTrait, DownloaderTrait;
+    use DownloaderTrait, SearchesTrait, DeemixTrait;
 
     /**
      * ApiController constructor.
@@ -25,28 +27,10 @@ class ApiController extends Controller
     /**
      * Just response status.
      *
-     * @return array
+     * @return JsonResponse
      */
     public function index()
     {
-        return $this->ok();
-    }
-
-    /**
-     * @param $data
-     * @param string $arrayName
-     * @param int    $status
-     * @param $headers
-     *
-     * @return array
-     */
-    private function ok($data = null, $arrayName = 'data', $status = 200, $headers = [])
-    {
-        $result = ['status' => 'ok'];
-        if (! is_null($data)) {
-            $result = array_merge($result, [$arrayName => $data]);
-        }
-
-        return response()->json($result, $status, $headers);
+        return okResponse();
     }
 }

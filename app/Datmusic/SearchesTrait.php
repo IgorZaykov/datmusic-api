@@ -6,202 +6,266 @@
 
 namespace App\Datmusic;
 
-use Illuminate\Http\Request;
+use App\Models\Audio;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Cache;
-use Psr\Http\Message\ResponseInterface;
+use Illuminate\Http\Request;
+use stdClass;
 
 trait SearchesTrait
 {
-    use CachesTrait, AuthenticatorTrait, ParserTrait;
+    use CachesTrait, ParserTrait, AlbumArtistSearchesTrait, MultisearchTrait, MinervaSearchTrait;
+
+    public static $SEARCH_BACKEND_AUDIOS = 'audios';
+    public static $SEARCH_BACKEND_ALBUMS = 'albums';
+    public static $SEARCH_BACKEND_ARTISTS = 'artists';
+    public static $SEARCH_BACKEND_MINERVA = 'minerva';
+    public static $SEARCH_BACKEND_DEEMIX = 'flacs';
+    public static $SEARCH_BACKEND_ARTIST = 'artist';
+    public static $SEARCH_BACKEND_TYPES = ['audios', 'albums', 'artists', 'minerva', 'flacs'];
+
+    private $count = 200;
+    private $accessTokenIndex = 0;
 
     /**
      * SearchesTrait constructor.
      */
     public function bootSearches()
     {
-        $this->bootAuthenticator();
+        $tokens = config('app.auth.tokens');
+
+        if (config('app.captcha_lock.weighted_tokens_enabled')) {
+            $tokenWeights = array_map(function ($index, $token) {
+                return [$index => $this->isCaptchaLocked($index) ? config('app.captcha_lock.locked_token_weight') : config('app.captcha_lock.unlocked_token_weight')];
+            }, range(0, count($tokens) - 1), $tokens);
+            $this->accessTokenIndex = getRandomWeightedElement(collect($tokenWeights)->flatten()->toArray());
+        } else {
+            $this->accessTokenIndex = array_rand(config('app.auth.tokens'));
+        }
     }
 
     /**
      * Searches audios from request query, with caching.
      *
-     * @param Request $request
-     *
-     * @return JsonResponse
+     * @param  Request  $request
+     * @return JsonResponse|array
      */
     public function search(Request $request)
     {
         // get inputs
-        $query = trim($request->get('q'));
-        $offset = abs(intval($request->get('page'))) * 50; // calculate offset from page index
+        $query = getQuery($request);
+        $offset = getPage($request) * $this->count; // calculate offset from page index
 
         $cacheKey = $this->getCacheKey($request);
+        $cachedResult = $this->getCache($cacheKey);
+        $isCachedQuery = ! is_null($cachedResult);
+
+        if (! $isCachedQuery && ! $request->has('captcha_key') && $this->isCaptchaLocked($this->accessTokenIndex)) {
+            $captchaError = $this->getCaptchaLockError($this->accessTokenIndex);
+            logger()->captchaLockedQuery($this->accessTokenIndex, $query, $captchaError['captcha_id']);
+
+            return errorResponse($captchaError);
+        }
 
         // return immediately if has in cache
-        $cachedResult = $this->getSearchResult($request);
-        if (! is_null($cachedResult)) {
-            logger()->searchCache($query, $offset);
+        if ($isCachedQuery) {
+            logger()->searchCache($query, $offset, 'count='.count($cachedResult));
 
-            return $this->ok(
-                $this->transformSearchResponse(
-                    $request,
-                    $cachedResult
-                )
-            );
+            return $this->cleanAudioList($request, $cacheKey, $cachedResult);
         }
 
-        // if the cookie file doesn't exist, we need to authenticate first
-        if (! $this->authenticated) {
-            $this->auth();
-            $this->authenticated = true;
+        $response = $this->getSearchResults($request, $query, $offset);
+        $error = $this->checkSearchResponseError($request, $response);
+        if ($error) {
+            return $error;
         }
 
-        // send request
-        $response = $this->getSearchResults($query, $offset);
+        // parse then store in cache
+        $data = $this->parseAudioItems($response->response->items);
+        $this->cacheResult($cacheKey, $data);
+        logger()->search($query, $offset, 'Account#'.$this->accessTokenIndex, 'count='.count($data));
 
-        // check for security checks
-        $this->authSecurityCheck($response);
-
-        // if not authenticated, authenticate then retry the search
-        if (! $this->checkIsAuthenticated($response)) {
-            // we need to get out of the loop. maybe something is wrong with authentication.
-            if ($this->authRetries >= 3) {
-                logger()->log('Auth.TooMany', $this->authRetries);
-                abort(403);
-            }
-            $this->auth();
-
-            return $this->search($request);
-        }
-
-        $result = $this->getAudioItems($response);
-
-        // get more pages if needed
-        for ($i = 1; $i < config('app.search.pageMultiplier'); $i++) {
-            // increment offset
-            $offset += 50;
-            // get result and parse it
-            $resultData = $this->getAudioItems($this->getSearchResults($query, $offset));
-
-            //  we can't request more pages if result is empty, break the loop
-            if (empty($resultData)) {
-                break;
-            }
-
-            $result = array_merge($result, $resultData);
-        }
-
-        // store in cache
-        $this->cacheSearchResult($cacheKey, $result);
-
-        logger()->search($query, $offset);
-
-        // parse data, save in cache, and response
-        return $this->ok($this->transformSearchResponse(
-            $request,
-            $result
-        ));
+        return $this->cleanAudioList($request, $cacheKey, $data);
     }
 
     /**
      * Request search page.
      *
-     * @param $query
-     * @param $offset
-     *
-     * @return ResponseInterface
+     * @param  Request  $request
+     * @param  string  $query
+     * @param  int  $offset
+     * @return stdClass
      */
-    private function getSearchResults($query, $offset)
+    private function getSearchResults(Request $request, string $query, int $offset)
     {
         if (empty($query)) {
-            if (config('app.popularSearchEnabled')) {
-                return $this->getPopular($offset);
-            } else {
-                $query = randomArtist();
-            }
+            $query = randomQuery();
         }
 
-        $query = urlencode($query);
+        $captchaParams = $this->getCaptchaParams($request);
+        $params = [
+            'access_token' => config('app.auth.tokens')[$this->accessTokenIndex],
+            'q'            => $query,
+            'offset'       => $offset,
+            'count'        => $this->count,
+        ];
 
-        return httpClient()->get(
-            "audio?act=search&q=$query&offset=$offset",
-            ['cookies' => $this->jar]
-        );
+        return as_json(vkClient()->get('method/audio.search', [
+            'query' => $params + $captchaParams,
+        ]
+        ));
     }
 
     /**
-     * Request popular page.
+     * Get captcha inputs from given request.
      *
-     * @param $offset
-     *
-     * @return ResponseInterface
+     * @param  Request  $request
+     * @return array extra params array to send to solve captcha if there's a key in request or empty array
      */
-    private function getPopular($offset)
+    protected function getCaptchaParams(Request $request)
     {
-        return httpClient()->get(
-            "audio?act=popular&offset=$offset",
-            ['cookies' => $this->jar]
-        );
+        if ($request->has('captcha_key')) {
+            $captchaParams = [
+                'captcha_sid' => $request->get('captcha_id'),
+                'captcha_key' => $request->get('captcha_key'),
+            ];
+            $this->accessTokenIndex = min(intval($request->get('captcha_index', 0)), $this->accessTokenIndex);
+
+            return $captchaParams;
+        } else {
+            return [];
+        }
+    }
+
+    /**
+     * @param  Request  $request
+     * @param  stdClass  $response
+     * @return bool|JsonResponse
+     */
+    protected function checkSearchResponseError(Request $request, stdClass $response)
+    {
+        $hasCaptchaKey = $request->has('captcha_key');
+        if (property_exists($response, 'error')) {
+            $error = $response->error;
+            $errorData = [
+                'message' => $error->error_msg,
+                'code'    => $error->error_code,
+            ];
+            if ($error->error_code == 14) {
+                $captcha = [
+                    'id'            => 'captcha',
+                    'captcha_index' => $this->accessTokenIndex,
+                    'captcha_id'    => intval($error->captcha_sid),
+                    'captcha_img'   => $error->captcha_img,
+                ];
+                $errorData = $errorData + $captcha;
+                $this->captchaLock($this->accessTokenIndex, $errorData);
+                reportCaptchaLock($request, $captcha, $error);
+
+                if ($hasCaptchaKey) {
+                    $this->captchaFailedAttempt($request);
+                }
+            }
+
+            return errorResponse($errorData);
+        } else {
+            if ($hasCaptchaKey && $this->isCaptchaLocked($this->accessTokenIndex)) {
+                $this->releaseCaptchaLock($this->accessTokenIndex);
+                reportCaptchaLockRelease($request);
+            }
+
+            return false;
+        }
     }
 
     /**
      * Cleanup data for response.
      *
-     * @param Request $request
-     * @param array   $data
-     *
+     * @param  Request  $request
+     * @param  string  $cacheKey
+     * @param  array  $data
+     * @param  bool  $sort
      * @return array
      */
-    private function transformSearchResponse($request, $data)
+    private function cleanAudioList(Request $request, string $cacheKey, array $data, bool $sort = true)
     {
         // if query matches sort regex, we shouldn't sort
         $query = $request->get('q');
-        $sortable = $this->isBadMatch([$query]) == false;
+        $sortable = $sort && $this->isBadMatch([$query]) == false;
 
         // items that needs to sorted to the end of response list if matches the regex
         $badMatches = [];
 
-        $cacheKey = $this->getCacheKey($request);
-        $mapped = array_map(function ($item) use (&$cacheKey, &$badMatches, &$sortable) {
-            $downloadUrl = fullUrl(sprintf('dl/%s/%s', $cacheKey, $item['id']));
-            $streamUrl = fullUrl(sprintf('stream/%s/%s', $cacheKey, $item['id']));
+        $hlsCount = 0;
 
-            $item['artist'] = $this->cleanBadWords($item['artist']);
-            $item['title'] = $this->cleanBadWords($item['title']);
+        $mapped = array_map(function ($item) use (&$cacheKey, &$badMatches, &$sortable, &$hlsCount) {
+            $downloadUrl = route('download', ['key' => $cacheKey, 'id' => $item['id']]);
+            $streamUrl = route('stream', ['key' => $cacheKey, 'id' => $item['id']]);
+            $coverUrl = route('cover', ['key' => $cacheKey, 'id' => $item['id']]);
 
-            // remove mp3 link and id from array
+            // we don't wanna share original mp3 urls
             unset($item['mp3']);
-            unset($item['id']);
-            unset($item['userId']);
 
             $result = array_merge($item, [
+                'key'      => $cacheKey,
+                'artist'   => $this->cleanBadWords($item['artist']),
+                'title'    => $this->cleanBadWords($item['title']),
                 'download' => $downloadUrl,
                 'stream'   => $streamUrl,
+                'cover'    => $coverUrl,
             ]);
 
             // is audio name bad match
             $badMatch = $sortable && $this->isBadMatch([$item['artist'], $item['title']]);
+
+            // count hls's for analytics for now
+            if (array_key_exists('is_hls', $item) && $item['is_hls']) {
+                $badMatch = true;
+                $hlsCount++;
+            }
 
             // add to bad matches
             if ($badMatch) {
                 array_push($badMatches, $result);
             }
 
+            if (array_key_exists('is_hls', $result)) {
+                unset($result['is_hls']);
+            }
+
             // remove from main array if bad match
             return $badMatch ? null : $result;
         }, $data);
 
-        // remove null items from mapped (nulls are added to badMatches, emptied in mapping above)
-        $mapped = array_filter($mapped);
+        if (! config('app.downloading.hls.enabled')) {
+            $badMatches = array_filter(array_map(function ($item) {
+                if (array_key_exists('is_hls', $item) && $item['is_hls']) {
+                    // don't mark as a bad match if it's already in minerva database
+                    if (config('app.minerva.database.enabled')) {
+                        if (Audio::find($item['id']) != null) {
+                            return $item;
+                        }
+                    }
 
-        // if there was any bad matches, merge with base list or just return
+                    return null;
+                } else {
+                    return $item;
+                }
+            }, $badMatches));
+        }
+
+        // remove null items from mapped (nulls are added to badMatches, emptied in mapping above)
+        $mapped = array_values(array_filter($mapped));
+
+        if ($hlsCount > 0) {
+            logger()->searchStatsHlsCount($query, 'count='.count($mapped).',hls_count='.$hlsCount);
+        }
+
+        // if there were any bad matches, merge with base list or just return
         return empty($badMatches) ? $mapped : array_merge($mapped, $badMatches);
     }
 
     /**
-     * @param array $strings items need to be tested
-     *
+     * @param  array  $strings  items need to be tested
      * @return bool true if any of inputs is bad match
      */
     private function isBadMatch(array $strings)
@@ -223,12 +287,65 @@ trait SearchesTrait
     /**
      * Replace bad words with empty string.
      *
-     * @param $string
-     *
-     * @return string clean string
+     * @param  string  $text
+     * @return string sanitized string
      */
-    private function cleanBadWords($string)
+    private function cleanBadWords(string $text)
     {
-        return preg_replace(config('app.search.badWordsRegex'), '', $string);
+        return preg_replace(config('app.search.badWordsRegex'), '', $text);
+    }
+
+    /**
+     * Standard audio response with optional caching for each audio item.
+     *
+     * @param  Request  $request
+     * @param  array  $data
+     * @param  bool  $cache
+     * @return JsonResponse
+     */
+    protected function audiosResponse(Request $request, array $data, bool $cache = true)
+    {
+        if ($cache) {
+            foreach ($data as $audio) {
+                $this->cacheAudioItem($audio['id'], $audio, true);
+            }
+        }
+
+        return okResponse($this->cleanAudioList($request, self::$expiringAudioSearchCacheKey, $data, false), self::$SEARCH_BACKEND_AUDIOS);
+    }
+
+    /**
+     * Checks for errors in given responses.
+     *
+     * @param ...$responses
+     * @return false|JsonResponse first found error or false
+     */
+    public function checkResponseErrors(...$responses)
+    {
+        foreach ($responses as $response) {
+            if ($response instanceof JsonResponse) {
+                if ($response->getOriginalContent()['status'] === 'error') {
+                    return $response;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Plucks given field key from response's data array.
+     *
+     * @param $response
+     * @param $key
+     * @return false|array
+     */
+    public function pluckItems($response, $key)
+    {
+        if ($response instanceof JsonResponse) {
+            return $response->getOriginalContent()['data'][$key];
+        }
+
+        return false;
     }
 }

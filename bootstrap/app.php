@@ -5,11 +5,9 @@
  */
 require_once __DIR__.'/../vendor/autoload.php';
 
-try {
-    (new Dotenv\Dotenv(__DIR__.'/../'))->load();
-} catch (Dotenv\Exception\InvalidPathException $e) {
-    //
-}
+(new Laravel\Lumen\Bootstrap\LoadEnvironmentVariables(
+    dirname(__DIR__)
+))->bootstrap();
 
 /*
 |--------------------------------------------------------------------------
@@ -30,8 +28,10 @@ $app->configure('app');
 $app->configure('database');
 $app->configure('cache');
 $app->configure('cors');
+$app->configure('tinker');
 
 $app->withFacades();
+$app->withEloquent();
 
 /*
 |--------------------------------------------------------------------------
@@ -73,11 +73,15 @@ $app->singleton('logger', function ($app) {
 */
 
 $app->middleware([
-    \Barryvdh\Cors\HandleCors::class,
+    App\Http\Middleware\ResponseTimeMiddleware::class,
+    App\Http\Middleware\BannedClientsMiddleware::class,
+    \Fruitcake\Cors\HandleCors::class,
 ]);
 
 $app->routeMiddleware([
     'auth.basic' => App\Http\Middleware\HttpBasicAuth::class,
+
+    'require_client_headers' => App\Http\Middleware\ClientHeadersMiddleware::class,
 ]);
 
 /*
@@ -91,9 +95,10 @@ $app->routeMiddleware([
 |
 */
 
-$app->register(App\Providers\AppServiceProvider::class);
 $app->register(Illuminate\Redis\RedisServiceProvider::class);
-$app->register(Barryvdh\Cors\LumenServiceProvider::class);
+$app->register(App\Providers\AppServiceProvider::class);
+$app->register(Fruitcake\Cors\CorsServiceProvider::class);
+$app->register(Laravel\Tinker\TinkerServiceProvider::class);
 
 /*
 |--------------------------------------------------------------------------
@@ -106,10 +111,10 @@ $app->register(Barryvdh\Cors\LumenServiceProvider::class);
 |
 */
 
-$app->group([
+$app->router->group([
     'namespace'  => 'App\Http\Controllers',
     'middleware' => 'auth.basic',
-], function ($app) {
+], function ($router) {
     require __DIR__.'/../routes/api.php';
 });
 

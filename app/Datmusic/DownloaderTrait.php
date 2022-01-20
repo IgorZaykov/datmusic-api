@@ -1,43 +1,27 @@
 <?php
 /**
- * Copyright (c) 2017  Alashov Berkeli
+ * Copyright (c) 2018  Alashov Berkeli
  * It is licensed under GNU GPL v. 2 or later. For full terms see the file LICENSE.
  */
 
 namespace App\Datmusic;
 
-use Aws\S3\S3Client;
-use Illuminate\Support\Str;
+use App\Jobs\PostProcessAudioJob;
 use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
-use Symfony\Component\HttpFoundation\BinaryFileResponse;
-use Symfony\Component\HttpKernel\Exception\HttpException;
+use Illuminate\Support\Str;
+use JamesHeinrich\GetID3\GetID3;
+use JamesHeinrich\GetID3\WriteTags;
+use Log;
 
 trait DownloaderTrait
 {
-    /**
-     * @var S3Client
-     */
-    protected $s3Client;
-    /**
-     * @var resource S3 stream context resource
-     */
-    protected $s3StreamContext;
-    /**
-     * @var bool is using s3 as storage
-     */
-    protected $isS3 = false;
-
     /**
      * DownloaderTrait constructor.
      */
     public function bootDownloader()
     {
-        if (config('app.aws.enabled')) {
-            $this->s3Client = new S3Client(config('app.aws.config'));
-            $this->s3Client->registerStreamWrapper();
-            $this->isS3 = true;
-        }
     }
 
     /**
@@ -45,10 +29,9 @@ trait DownloaderTrait
      *
      * @param $key
      * @param $id
-     *
      * @return int
      */
-    public function bytes($key, $id)
+    public function bytes(string $key, string $id)
     {
         logger()->log('Bytes', $key, $id);
 
@@ -62,8 +45,11 @@ trait DownloaderTrait
             }
 
             $item = $this->getAudio($key, $id);
+            if ($this->optimizeMp3Url($item)) {
+                return get_headers($item['mp3'], 1)['Content-Length'];
+            }
 
-            $response = httpClient()->head($item['mp3']);
+            $response = vkClient()->head($item['mp3']);
 
             return $response->getHeader('Content-Length')[0];
         });
@@ -72,85 +58,58 @@ trait DownloaderTrait
     /**
      * Just like download but with stream enabled.
      *
-     * @param string $key
-     * @param string $id
-     *
+     * @param  Request  $request
+     * @param  string  $key
+     * @param  string  $id
      * @return RedirectResponse
      */
-    public function stream($key, $id)
+    public function stream(Request $request, string $key, string $id)
     {
-        return $this->download($key, $id, true);
-    }
-
-    /**
-     * Just like download but with bitrate converting enabled.
-     *
-     * @param string $key
-     * @param string $id
-     * @param int    $bitrate
-     *
-     * @return BinaryFileResponse|RedirectResponse
-     */
-    public function bitrateDownload($key, $id, $bitrate)
-    {
-        return $this->download($key, $id, false, $bitrate);
+        return $this->download($request, $key, $id, true);
     }
 
     /**
      * Serves given audio item or aborts with 404 if not found.
      *
-     * @param string $key
-     * @param string $id
-     * @param bool   $stream
-     * @param int    $bitrate
-     *
-     * @return BinaryFileResponse|RedirectResponse
+     * @param  Request  $request
+     * @param  string  $key
+     * @param  string  $id
+     * @param  bool  $stream
+     * @return RedirectResponse
      */
-    public function download($key, $id, $stream = false, $bitrate = -1)
+    public function download(Request $request, string $key, string $id, bool $stream = false)
     {
-        if (! in_array($bitrate, config('app.conversion.allowed'))) {
-            $bitrate = -1;
+        if ($this->isDeemixId($id)) {
+            return $this->deemixDownload($request, $id, $stream);
         }
 
-        list($fileName, $localPath, $path) = $this->buildFilePathsForId($id);
+        $isRedirect = $request->has('redirect');
+        [$fileName, $subPath, $path] = $this->buildFilePathsForId($id);
 
-        // check bucket for file and redirect if exists
-        if ($this->isS3 && @file_exists($this->formatPathWithBitrate($path, $bitrate))) {
-            logger()->log('S3.Cache', $path, $bitrate);
-
-            return redirect($this->buildS3Url($this->formatPathWithBitrate($fileName, $bitrate)));
-        } else {
-            if (@file_exists($path)) {
-                $item = $this->getAudioCache($id);
-                // try looking in search cache if not found
-                if (is_null($item)) {
-                    $item = $this->getAudio($key, $id, false);
-                }
-                $name = ! is_null($item) ? $this->getFormattedName($item) : "$id.mp3";
-
-                $this->tryToConvert($bitrate, $path, $localPath, $fileName, $name);
-
-                return $this->downloadLocal($path, $fileName, $key, $id, $name, $stream, true);
+        if (@file_exists($path)) {
+            $audioItem = $this->getCachedAudio($id);
+            // try looking in search cache if not found
+            if (is_null($audioItem)) {
+                $audioItem = $this->getAudio($key, $id, false);
             }
+            $name = ! is_null($audioItem) ? $this->getFormattedName($audioItem) : "$id.mp3";
+
+            return $this->downloadLocal($path, $subPath, $fileName, $key, $id, $name, $stream, true, $isRedirect);
         }
 
-        $item = $this->getAudio($key, $id);
-        $name = $this->getFormattedName($item);
+        $fetchNewMp3Url = $key === self::$SEARCH_BACKEND_MINERVA;
 
-        if ($this->isS3) {
-            $this->s3StreamContext = $this->buildS3StreamContextOptions($name);
-        }
+        $audioItem = $this->getAudio($key, $id, true, $fetchNewMp3Url);
+        $proxy = ! $this->optimizeMp3Url($audioItem);
+        $name = $this->getFormattedName($audioItem);
 
-        if ($this->downloadFile($item['mp3'], $path)) {
-            $this->tryToConvert($bitrate, $path, $localPath, $fileName, $name);
+        if ($this->downloadAudio($audioItem['mp3'], $path, $proxy, $audioItem)) {
+            $this->writeAudioTags($audioItem, $path);
+            $this->onDownloadCallback($audioItem);
 
-            if ($this->isS3) {
-                return redirect($this->buildS3Url($fileName));
-            } else {
-                return $this->downloadLocal($path, $fileName, $key, $id, $name, $stream, false);
-            }
+            return $this->downloadLocal($path, $subPath, $fileName, $key, $id, $name, $stream, false, $isRedirect);
         } else {
-            abort(404);
+            abort(500);
         }
     }
 
@@ -158,168 +117,112 @@ trait DownloaderTrait
      * Download/Stream local file.
      *
      * @param $path     string full path
+     * @param $subPath  string sub path
      * @param $fileName string file name
      * @param $key      string search key
      * @param $id       string audio id
      * @param $name     string download response name
      * @param $stream   boolean  is stream
      * @param $cache    boolean is cache
-     *
-     * @return BinaryFileResponse|RedirectResponse
+     * @param $redirect boolean is redirect
+     * @return RedirectResponse
      */
-    private function downloadLocal($path, $fileName, $key, $id, $name, $stream, $cache)
+    private function downloadLocal(string $path, string $subPath, string $fileName, string $key, string $id, string $name, bool $stream, bool $cache, bool $redirect)
     {
         if ($stream) {
-            $this->checkIsBadMp3($path);
-            logger()->stream($cache, $key, $id);
+            logger()->stream($cache, $key, $id, $name);
 
-            return redirect("mp3/$fileName");
+            return redirect("mp3/$subPath/$fileName");
         } else {
-            logger()->download($cache, $key, $id);
+            logger()->download($cache, $key, $id, $name, $redirect);
+            if ($redirect) {
+                return redirect("mp3/$subPath/$fileName");
+            }
 
             return $this->downloadResponse($path, $name);
         }
     }
 
     /**
-     * Try to convert mp3 if possible, alters given path and file path if succeeds.
+     * Creates symlink to original mp3 file with given file name at /links/{sub_path}/{mp3_hash}/{name}.
+     * For now, we are getting mp3 hash from file name of given path.
      *
-     * @param $bitrate   int bitrate
-     * @param $path      string path
-     * @param $localPath string local file path
-     * @param $fileName  string file name
-     * @param $name      string file name (logging)
+     * @param $path string path of the file
+     * @param $name string name of the downloading file
+     * @return RedirectResponse|void
      */
-    private function tryToConvert($bitrate, &$path, $localPath, &$fileName, &$name)
+    private function downloadResponse(string $path, string $name)
     {
-        $convertResult = $this->bitrateConvert($bitrate, $path, $localPath, $fileName);
+        $hash = basename($path, '.mp3');
+        $subPath = subPathForHash($hash);
+        $filePath = sprintf('%s/%s', $hash, $name);
+        $linkFolderPath = sprintf('%s/%s/%s', config('app.paths.links'), $subPath, $hash);
+        $linkPath = sprintf('%s/%s', $linkFolderPath, $name);
 
-        if ($convertResult != false) {
-            list($fileName, $path) = $convertResult;
-            logger()->convert($name, $bitrate);
-            $name = str_replace('.mp3', " ($bitrate).mp3", $name);
-        }
-    }
-
-    /**
-     * @param $bitrate
-     * @param $path
-     * @param $localPath
-     * @param $fileName
-     *
-     * @return array|bool
-     */
-    private function bitrateConvert($bitrate, $path, $localPath, $fileName)
-    {
-        if ($bitrate > 0) {
-            // Download to local if s3 mode and upload converted one to s3
-            // Change path only if already converted or conversion function returns true
-
-            $pathConverted = $this->formatPathWithBitrate($localPath, $bitrate);
-            $fileNameConverted = $this->formatPathWithBitrate($fileName, $bitrate);
-
-            // s3 mode
-            if ($this->isS3) {
-                // download file from s3 to local
-                // continue only if download succeeds
-                $convertable = $this->downloadFile($this->buildS3Url($fileName), $localPath);
-            } else {
-                $convertable = true;
-            }
-
-            if ($convertable) {
-                if (file_exists($pathConverted)
-                    || $this->convertMp3Bitrate($bitrate, $localPath, $pathConverted)
-                ) {
-                    // upload converted file
-                    if ($this->isS3) {
-                        $converted = fopen($pathConverted, 'r');
-                        $s3ConvertedPath = $this->formatPathWithBitrate($path, $bitrate);
-                        $s3Stream = fopen($s3ConvertedPath, 'w', false, $this->s3StreamContext);
-
-                        // if upload succeeds
-                        if (stream_copy_to_stream($converted, $s3Stream) != false) {
-                            $convertedPaths = [$fileNameConverted, $path];
-                        }
-                    } else {
-                        $convertedPaths = [$fileNameConverted, $pathConverted];
-                    }
-                }
-            }
+        if (file_exists($linkPath) || ((file_exists($linkFolderPath) || mkdir($linkFolderPath, 0777, true)) && symlink($path, $linkPath))) {
+            return redirect("links/$subPath/$filePath");
         }
 
-        return isset($convertedPaths) ? $convertedPaths : false;
+        abort(500, "Couldn't create symlink for downloading");
     }
 
     /**
      * Formats name, appends mp3, ascii-fy and remove bad characters.
      *
-     * @param array $item
-     *
+     * @param  array  $audio
      * @return string formatted name
      */
-    public function getFormattedName($item)
+    private function getFormattedName(array $audio)
     {
-        $name = sprintf('%s - %s', $item['artist'], $item['title']);
+        $name = sprintf('%s - %s', $audio['artist'], $audio['title']);
         $name = Str::ascii($name);
         $name = sanitize($name, false, false);
-        $name = sprintf('%s.mp3', $name);
 
-        return $name;
+        return sprintf('%s.mp3', $name);
     }
 
     /**
      * Build file name and full path for given audio id.
      *
-     * @param string $id audio id
-     *
-     * @return array 0 - file name, 1 - full local path, 2 - full local path or s3 path
+     * @param  string  $id  audio id
+     * @return array 0 - file name, 1 - sub path, 2 - full local path
      */
-    public function buildFilePathsForId($id)
+    private function buildFilePathsForId(string $id)
     {
-        $fileName = sprintf('%s.mp3', hash(config('app.hash.mp3'), $id));
-        $localPath = sprintf('%s/%s', config('app.paths.mp3'), $fileName);
-        $path = $localPath;
+        $hash = hash(config('app.hash.mp3'), $id);
+        $subPath = subPathForHash($hash);
+        $fileName = sprintf('%s.mp3', $hash);
+        $path = sprintf('%s/%s', config('app.paths.mp3'), $subPath);
 
-        if ($this->isS3) {
-            $s3PathWithFolder = sprintf(config('app.aws.paths.mp3'), $fileName);
-            $path = sprintf('s3://%s/%s', config('app.aws.bucket'), $s3PathWithFolder);
+        if (! is_dir($subPath)) {
+            @mkdir($path, 0755, true);
         }
 
-        return [$fileName, $localPath, $path];
-    }
+        $path = sprintf('%s/%s', $path, $fileName);
 
-    /**
-     * @param string $path    path to mp3
-     * @param int    $bitrate bitrate
-     *
-     * @return string path_bitrate.mp3 formatted path
-     */
-    private function formatPathWithBitrate($path, $bitrate)
-    {
-        if ($bitrate > 0) {
-            return str_replace('.mp3', "_$bitrate.mp3", $path);
-        } else {
-            return $path;
-        }
+        return [$fileName, $subPath, $path];
     }
 
     /**
      * Download given file url to given path.
      *
-     * @param string $url
-     * @param string $path
-     *
+     * @param  string  $url
+     * @param  string  $path
+     * @param  bool  $proxy
+     * @param  array  $audioItem
      * @return bool true if succeeds
      */
-    public function downloadFile($url, $path)
+    private function downloadAudio(string $url, string $path, bool $proxy = true, array $audioItem = [])
     {
-        if ($this->s3StreamContext == null) {
-            $handle = fopen($path, 'w');
-        } else {
-            $handle = fopen($path, 'w', false, $this->s3StreamContext);
+        if (! file_exists(dirname($path))) {
+            mkdir(dirname($path), 0777, true);
         }
 
+        if (config('app.downloading.hls.enabled') && array_key_exists('is_hls', $audioItem) && $audioItem['is_hls']) {
+            return $this->downloadAudioFfmpeg($url, $path, $proxy, $audioItem);
+        }
+
+        $handle = fopen($path, 'w');
         $curl = curl_init($url);
         curl_setopt($curl, CURLOPT_FILE, $handle);
         curl_setopt($curl, CURLOPT_HEADER, 0);
@@ -327,7 +230,7 @@ trait DownloaderTrait
         curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, config('app.downloading.timeout.connection'));
         curl_setopt($curl, CURLOPT_TIMEOUT, config('app.downloading.timeout.execution'));
 
-        if (env('PROXY_ENABLE', false)) {
+        if ($proxy && env('PROXY_ENABLE', false)) {
             curl_setopt($curl, CURLOPT_PROXY, env('PROXY_IP'));
             curl_setopt($curl, CURLOPT_PROXYPORT, env('PROXY_PORT'));
             curl_setopt($curl, CURLOPT_PROXYTYPE, env('PROXY_METHOD'));
@@ -342,10 +245,12 @@ trait DownloaderTrait
         // if curl had errors
         if (curl_errno($curl) > 0) {
             logger()->log('Download.Fail', curl_errno($curl));
-
-            // remove the file just in case
             @unlink($path);
 
+            return false;
+        }
+
+        if (! $this->verifyDownloadedFile($path, $audioItem)) {
             return false;
         }
 
@@ -357,135 +262,118 @@ trait DownloaderTrait
     }
 
     /**
-     * Checks given files mime type and aborts with 404 if file is not an mp3 file.
+     * Download audio using ffmpeg.
      *
-     * @param string $path full path of mp3
-     *
-     * @throws HttpException
+     * @param  string  $url
+     * @param  string  $path
+     * @param  bool  $proxy
+     * @param  array  $audioItem
+     * @return bool
      */
-    public function checkIsBadMp3($path)
+    private function downloadAudioFfmpeg(string $url, string $path, bool $proxy = true, array $audioItem = [])
     {
-        if (! file_exists($path)) {
-            logger()->log('Download.Bad.NotFound');
-
-            abort(404);
+        $startedAt = microtime(true);
+        $ffmpeg = config('app.tools.ffmpeg_path');
+        if ($proxy && env('PROXY_ENABLE', false)) {
+            $ffmpeg .= sprintf(' -http_proxy %s', buildHttpProxyString());
         }
 
-        // valid mimes
-        $validMimes = ['audio/mpeg', 'audio/mp3', 'application/octet-stream'];
+        $command = "$ffmpeg -i $url -c copy $path";
+        exec($command, $exOutput, $result);
 
-        $mime = finfo_file(finfo_open(FILEINFO_MIME_TYPE), $path);
-        // checks mime-type with unix file command
-        $nativeCheck = function () use ($path) {
-            return exec("file -b --mime-type $path");
-        };
+        // check if command had errors and verify the file
+        if ($result != 0 || ! $this->verifyDownloadedFile($path, $audioItem)) {
+            return false;
+        }
 
-        $checks = [$mime, $nativeCheck()];
+        $elapsed = round(microtime(true) - $startedAt, 3);
+        logger()->statsHlsDownloadTime($audioItem['id'], $elapsed);
 
-        // md5 hash blacklist of bad mp3's
-        $badMp3Hashes = [
-            '9d6ddee7a36a6b1b638c2ca1e26ad46e',
-            '8efd23e1cf7989a537a8bf0fb3ed7f62',
-            '21a9fef2f321de657d7b54985be55888',
-        ];
-        $badMp3 = in_array(md5_file($path), $badMp3Hashes);
+        return true;
+    }
 
-        // if the file is corrupted (mime is wrong) or md5 file is one of the bad mp3s,
-        // delete it from storage and return 404
-        if ($badMp3 || ! count(array_intersect($checks, $validMimes))) { // if arrays don't have any common values, mp3 is broken.
-            logger()->log('Download.Bad.'.($badMp3 ? 'Mp3' : 'Mime'), $path, implode(' ', $checks));
-
+    /**
+     * Verify whether the given file is an audio file.
+     *
+     * @param  string  $path
+     * @param  array  $audioItem
+     * @return bool
+     */
+    private function verifyDownloadedFile(string $path, array $audioItem)
+    {
+        $fileMimeType = get_mime_type($path);
+        if (! isMimeTypeAudio($fileMimeType)) {
+            logger()->log('Download.Fail.InvalidAudio', json_encode([$audioItem['id'], $audioItem['artist'], $audioItem['title'], $fileMimeType]));
             @unlink($path);
-            abort(404);
+
+            return false;
+        } else {
+            return true;
         }
     }
 
     /**
-     * Force download given file with given name.
+     * Try to write mp3 id3 tags.
      *
-     * @param $path string path of the file
-     * @param $name string name of the downloading file
-     *
-     * @return BinaryFileResponse
+     * @param $audio array an array with fields title and artist
+     * @param $path  string full path to file
      */
-    public function downloadResponse($path, $name)
+    private function writeAudioTags(array $audio, string $path)
     {
-        $this->checkIsBadMp3($path);
+        try {
+            $encoding = 'UTF-8';
+            $getID3 = new GetID3();
+            $getID3->setOption(['encoding' => $encoding]);
+            $writer = new WriteTags();
+            $writer->filename = $path;
+            $writer->tagformats = ['id3v1', 'id3v2.3'];
+            $writer->remove_other_tags = false;
+            $writer->tag_encoding = $encoding;
 
-        $headers = [
-            'Cache-Control'     => 'private',
-            'Cache-Description' => 'File Transfer',
-            'Content-Type'      => 'audio/mpeg',
-            'Content-Length'    => filesize($path),
-        ];
-
-        return response()->download(
-            $path,
-            $name,
-            $headers
-        );
-    }
-
-    /**
-     * Executes ffmpeg command synchronously for converting given file to given bitrate.
-     *
-     * @param $bitrate integer, one of $config["allowed_bitrates"]
-     * @param $input   string input mp3 file full path
-     * @param $output  string output mp3 file full path
-     *
-     * @return bool is success
-     */
-    public function convertMp3Bitrate($bitrate, $input, $output)
-    {
-        $bitrateString = config('app.conversion.allowed_ffmpeg')[array_search($bitrate,
-            config('app.conversion.allowed'))];
-        $ffmpegPath = config('app.conversion.ffmpeg_path');
-
-        exec("$ffmpegPath -i $input -codec:a libmp3lame $bitrateString $output", $exOutput,
-            $result);
-
-        return $result == 0;
-    }
-
-    // s3 utils
-
-    /**
-     * Builds url with region and bucket name from config.
-     *
-     * @param string $fileName path to file
-     *
-     * @return string full url
-     */
-    private function buildS3Url($fileName)
-    {
-        if (env('CDN_ROOT_URL', null) !== null) {
-            return sprintf('%s%s', env('CDN_ROOT_URL'), $fileName);
+            $tags = [
+                'title'   => [$audio['title']],
+                'artist'  => [$audio['artist']],
+                'comment' => [config('app.downloading.id3.comment')],
+            ];
+            if (array_key_exists('album', $audio)) {
+                $tags = array_merge($tags, [
+                    'album' => [$audio['album']],
+                ]);
+            }
+            $downloadCovers = config('app.downloading.id3.download_covers');
+            if ($downloadCovers) {
+                if ($coverImage = covers()->getCoverFile($audio)) {
+                    if ($coverImageFile = file_get_contents($coverImage)) {
+                        if ($coverImageExif = exif_imagetype($coverImage)) {
+                            $tags['attached_picture'][0]['data'] = $coverImageFile;
+                            $tags['attached_picture'][0]['mime'] = image_type_to_mime_type($coverImageExif);
+                            $tags['attached_picture'][0]['picturetypeid'] = 0x03;
+                            $tags['attached_picture'][0]['description'] = 'cover';
+                        } else {
+                            Log::error('Unable to read cover image exif while trying to write to mp3', [$coverImage]);
+                        }
+                    } else {
+                        Log::error('Unable to read cover image file while trying to write to mp3', [$coverImage]);
+                    }
+                    @unlink($coverImage);
+                }
+            }
+            $writer->tag_data = $tags;
+            $writer->WriteTags();
+        } catch (\getid3_exception $e) {
+            Log::error('Exception while writing id3 tags', [$audio, $path, $e]);
         }
-
-        $region = config('app.aws.config.region');
-        $bucket = config('app.aws.bucket');
-        $path = sprintf(config('app.aws.paths.mp3'), $fileName);
-
-        return "https://s3-$region.amazonaws.com/$bucket/$path";
     }
 
     /**
-     * Builds S3 schema stream context options
-     * All options available at http://docs.aws.amazon.com/aws-sdk-php/v3/api/api-s3-2006-03-01.html#putobject.
+     * Dispatch post process audio job if enabled.
      *
-     * @param string $name Force download file name
-     *
-     * @return resource
+     * @param  array  $audioItem  audio item info
      */
-    private function buildS3StreamContextOptions($name)
+    public function onDownloadCallback(array $audioItem)
     {
-        return stream_context_create([
-            's3' => [
-                'ACL'                => 'public-read',
-                'ContentType'        => 'audio/mpeg',
-                'ContentDisposition' => "attachment; filename=\"$name\"",
-                'StorageClass'       => 'STANDARD_IA',
-            ],
-        ]);
+        if (config('app.downloading.post_process.enabled')) {
+            dispatch(new PostProcessAudioJob($audioItem))->onQueue('post_process');
+        }
     }
 }

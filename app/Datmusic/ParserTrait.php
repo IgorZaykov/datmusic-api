@@ -6,52 +6,136 @@
 
 namespace App\Datmusic;
 
-use PHPHtmlParser\Dom;
-use Psr\Http\Message\ResponseInterface;
+use Exception;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+use Log;
 
 trait ParserTrait
 {
     /**
-     * Parses response html for audio items, saves it in cache and returns parsed array.
+     * Maps response to audio items.
      *
-     * @param ResponseInterface $response
-     *
+     * @param  array  $audios
      * @return array
      */
-    public static function getAudioItems($response)
+    public function parseAudioItems(array $audios)
     {
-        $dom = new Dom();
-        $dom->load((string) $response->getBody());
-
-        // find user id from body
-        preg_match('/vk_id=\d{1,20}/', $response->getBody(), $userIdMatch);
-        $userId = explode('vk_id=', $userIdMatch[0])[1];
-
-        $items = $dom->find('.audio_item');
         $data = [];
+        foreach ($audios as $item) {
+            if (isset($item->content_restricted) && empty($item->url)) {
+                Log::debug('Audio item restricted, skipping it', [$item]);
+                continue;
+            }
 
-        foreach ($items as $item) {
-            $audio = new Dom();
-            $audio->load($item->innerHtml);
+            $id = $item->id;
+            $userId = $item->owner_id;
+            $sourceId = sprintf('%s_%s', $userId, $id);
+            $artist = $item->artist;
+            $title = $item->title;
+            $duration = $item->duration;
+            $date = $item->date;
+            $mp3 = $item->url;
+            $isExplicit = $item->is_explicit;
+            $isHls = false;
 
-            $id = explode('_search', $item->getAttribute('data-id'))[0];
-            $artist = $audio->find('.ai_artist')->text(true);
-            $title = $audio->find('.ai_title')->text(true);
-            $duration = $audio->find('.ai_dur')->getAttribute('data-dur');
-            $mp3 = $audio->find('input[type=hidden]')->value;
+            $peskyHlsReg = '/(psv4\.vkuseraudio\.net\/audio\/ee)/';
+            $hlsReg = '/(\/[a-zA-Z0-9]{1,30})(\/audios)?\/([a-zA-Z0-9]{1,30})(\/index\.m3u8)/';
+            preg_match($peskyHlsReg, $mp3, $peskyHlsMatches);
+            preg_match($hlsReg, $mp3, $matches);
 
-            $hash = hash(config('app.hash.id'), $id);
+            if (! empty($peskyHlsMatches)) {
+                $isHls = true;
+            } else {
+                if (array_key_exists(4, $matches)) {
+                    $mp3 = str_replace($matches[1], '', $mp3);
+                    $mp3 = str_replace($matches[4], '.mp3', $mp3);
+                }
+            }
 
-            array_push($data, [
-                'id'       => $hash,
-                'userId'   => $userId,
-                'artist'   => trim(html_entity_decode($artist, ENT_QUOTES)),
-                'title'    => trim(html_entity_decode($title, ENT_QUOTES)),
-                'duration' => (int) $duration,
-                'mp3'      => $mp3,
-            ]);
+            if (! Str::endsWith($mp3, '.mp3')) {
+                $isHls = true;
+            }
+
+            $hash = hash(config('app.hash.id'), $sourceId);
+
+            $itemData = [
+                'id'          => $hash,
+                'source_id'   => $sourceId,
+                'artist'      => trim(html_entity_decode($artist, ENT_QUOTES)),
+                'title'       => trim(html_entity_decode($title, ENT_QUOTES)),
+                'duration'    => (int) $duration,
+                'date'        => $date,
+                'mp3'         => $mp3,
+                'is_explicit' => $isExplicit,
+                'is_hls'      => $isHls,
+            ];
+
+            if (isset($item->album)) {
+                $itemData = array_merge($itemData, [
+                    'album' => $item->album->title,
+                ]);
+                if (isset($item->album->thumb)) {
+                    try {
+                        $itemData = array_merge($itemData, [
+                            'cover_url_small'  => $item->album->thumb->photo_300,
+                            'cover_url_medium' => $item->album->thumb->photo_600,
+                            'cover_url'        => $item->album->thumb->photo_1200,
+                        ]);
+                    } catch (Exception $exception) {
+                        Log::debug('Error while parsing thumbs', [$item]);
+                    }
+                }
+            }
+
+            array_push($data, $itemData);
         }
 
         return $data;
+    }
+
+    public function cleanAudioItemForStorage(array $audioItem): array
+    {
+        $item = $audioItem;
+
+        // cleanup unnecessary fields
+        unset($item['mp3']);
+
+        return $item;
+    }
+
+    /**
+     * Tries to get mp3 url bounded to this machines IP when proxy enabled, to avoid downloading mp3 via proxy.
+     * Uses VK's bug/hack which leaks new mp3 url for requester's IP.
+     *
+     * @param  array  $item  audio item
+     * @return bool has been optimized or not
+     */
+    public function optimizeMp3Url(&$item)
+    {
+        if (! env('PROXY_ENABLE', false)) {
+            return false;
+        }
+
+        try {
+            $locations = get_headers($item['mp3'], 1)['Location'];
+
+            if (! is_array($locations) || count($locations) < 2) {
+                return false;
+            }
+
+            $url = Arr::last($locations);
+            if (Str::startsWith($url, 'https://vk.com/err404.php')) {
+                return false;
+            } else {
+                $item['mp3'] = $url;
+
+                return true;
+            }
+        } catch (Exception $e) {
+            Log::error('Exception while trying to optimize url', [$item, $e]);
+
+            return false;
+        }
     }
 }
